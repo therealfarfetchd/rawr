@@ -27,8 +27,8 @@
 //! let client = RedditClient::new(agent, AnonymousAuthenticator::new());
 //! ```
 
-use std::sync::{Arc, Mutex, MutexGuard};
 use std::io::Read;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use hyper::client::{Client, RequestBuilder};
 use hyper::header::UserAgent;
@@ -36,15 +36,15 @@ use hyper::net::HttpsConnector;
 use hyper::status::StatusCode::Unauthorized;
 use hyper_native_tls::NativeTlsClient;
 
-use serde_json::from_str;
 use serde::de::DeserializeOwned;
+use serde_json::from_str;
 
-use structures::subreddit::Subreddit;
-use structures::user::User;
-use structures::submission::LazySubmission;
-use structures::messages::MessageInterface;
 use auth::Authenticator;
 use errors::APIError;
+use structures::messages::MessageInterface;
+use structures::submission::LazySubmission;
+use structures::subreddit::Subreddit;
+use structures::user::User;
 
 /// A client to connect to Reddit. See the module-level documentation for examples.
 pub struct RedditClient {
@@ -54,14 +54,16 @@ pub struct RedditClient {
     user_agent: String,
     authenticator: Arc<Mutex<Box<Authenticator + Send>>>,
     auto_logout: bool,
+    regionlock_workaround: bool,
 }
-
 
 impl RedditClient {
     /// Creates an instance of the `RedditClient` using the provided user agent.
-    pub fn new(user_agent: &str,
-               authenticator: Arc<Mutex<Box<Authenticator + Send>>>)
-               -> RedditClient {
+    pub fn new(
+        user_agent: &str,
+        authenticator: Arc<Mutex<Box<Authenticator + Send>>>,
+        regionlock_workaround: bool,
+    ) -> RedditClient {
         // Connection pooling is problematic if there are pauses/sleeps in the program, so we
         // choose to disable it by using a non-pooling connector.
         let ssl = NativeTlsClient::new().expect("Failed to acquire TLS client");
@@ -73,6 +75,7 @@ impl RedditClient {
             user_agent: user_agent.to_owned(),
             authenticator: authenticator,
             auto_logout: true,
+            regionlock_workaround,
         };
 
         this.get_authenticator()
@@ -102,12 +105,15 @@ impl RedditClient {
     /// Unauthorized error, then reruns the lambda. If the lambda fails twice, or fails due to
     /// a different error, the error is returned.
     pub fn ensure_authenticated<F, T>(&self, lambda: F) -> Result<T, APIError>
-        where F: Fn() -> Result<T, APIError>
+    where
+        F: Fn() -> Result<T, APIError>,
     {
         let res = lambda();
         match res {
             Err(APIError::HTTPError(Unauthorized)) => {
-                try!(self.get_authenticator().refresh_token(&self.client, &self.user_agent));
+                try!(self
+                    .get_authenticator()
+                    .refresh_token(&self.client, &self.user_agent));
                 lambda()
             }
             _ => res,
@@ -132,23 +138,30 @@ impl RedditClient {
     }
 
     /// Creates a full URL using the correct access point (API or OAuth) from the stem.
-    pub fn build_url(&self,
-                     dest: &str,
-                     oauth_required: bool,
-                     authenticator: &mut MutexGuard<Box<Authenticator + Send + 'static>>)
-                     -> String {
+    pub fn build_url(
+        &self,
+        dest: &str,
+        oauth_required: bool,
+        authenticator: &mut MutexGuard<Box<Authenticator + Send + 'static>>,
+    ) -> String {
         let oauth_supported = authenticator.oauth();
         let stem = if oauth_required || oauth_supported {
             // All endpoints support OAuth, but some do not support the regular endpoint. If we are
             // required to use it or support it, we will use it.
-            assert!(oauth_supported,
-                    "OAuth is required to use this endpoint, but your authenticator does not \
-                     support it.");
+            assert!(
+                oauth_supported,
+                "OAuth is required to use this endpoint, but your authenticator does not \
+                 support it."
+            );
             "https://oauth.reddit.com"
         } else {
             "https://api.reddit.com"
         };
-        format!("{}{}", stem, dest)
+        if self.regionlock_workaround {
+            format!("{}/{}", stem, dest)
+        } else {
+            format!("{}{}", stem, dest)
+        }
     }
 
     /// Wrapper around the `get` function of `hyper::client::Client`, which sends a HTTP GET
@@ -166,13 +179,16 @@ impl RedditClient {
     /// Sends a GET request with the specified parameters, and returns the resulting
     /// deserializeOwnedd object.
     pub fn get_json<T>(&self, dest: &str, oauth_required: bool) -> Result<T, APIError>
-        where T: DeserializeOwned
+    where
+        T: DeserializeOwned,
     {
         self.ensure_authenticated(|| {
             let mut response = try!(self.get(dest, oauth_required).send());
             if response.status.is_success() {
                 let mut buf = String::new();
-                response.read_to_string(&mut buf).expect("Buffer read failed");
+                response
+                    .read_to_string(&mut buf)
+                    .expect("Buffer read failed");
                 let json: T = try!(from_str(&buf));
                 Ok(json)
             } else {
@@ -196,13 +212,16 @@ impl RedditClient {
     /// Sends a post request with the specified parameters, and converts the resulting JSON
     /// into a deserializeOwnedd object.
     pub fn post_json<T>(&self, dest: &str, body: &str, oauth_required: bool) -> Result<T, APIError>
-        where T: DeserializeOwned
+    where
+        T: DeserializeOwned,
     {
         self.ensure_authenticated(|| {
             let mut response = try!(self.post(dest, oauth_required).body(body).send());
             if response.status.is_success() {
                 let mut buf = String::new();
-                response.read_to_string(&mut buf).expect("Buffer read failed");
+                response
+                    .read_to_string(&mut buf)
+                    .expect("Buffer read failed");
                 let json: T = try!(from_str(&buf));
                 Ok(json)
             } else {
@@ -213,11 +232,12 @@ impl RedditClient {
 
     /// Sends a post request with the specified parameters, and ensures that the response
     /// has a success header (HTTP 2xx).
-    pub fn post_success(&self,
-                        dest: &str,
-                        body: &str,
-                        oauth_required: bool)
-                        -> Result<(), APIError> {
+    pub fn post_success(
+        &self,
+        dest: &str,
+        body: &str,
+        oauth_required: bool,
+    ) -> Result<(), APIError> {
         self.ensure_authenticated(|| {
             let response = try!(self.post(dest, oauth_required).body(body).send());
             if response.status.is_success() {
@@ -289,7 +309,9 @@ impl RedditClient {
 impl Drop for RedditClient {
     fn drop(&mut self) {
         if self.auto_logout {
-            self.get_authenticator().logout(&self.client, &self.user_agent).unwrap();
+            self.get_authenticator()
+                .logout(&self.client, &self.user_agent)
+                .unwrap();
         }
     }
 }
